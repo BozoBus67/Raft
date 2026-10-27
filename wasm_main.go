@@ -25,7 +25,6 @@ var world *cluster
 
 func main() {
 	world = newCluster()
-	world.boot()
 
 	js.Global().Set("raftGetState", js.FuncOf(jsGetState))
 	js.Global().Set("raftTick", js.FuncOf(jsTick))
@@ -33,6 +32,8 @@ func main() {
 	js.Global().Set("raftAddNode", js.FuncOf(jsAddNode))
 	js.Global().Set("raftDeleteNode", js.FuncOf(jsDeleteNode))
 	js.Global().Set("raftReset", js.FuncOf(jsReset))
+	js.Global().Set("raftShutdown", js.FuncOf(jsShutdown))
+	js.Global().Set("raftStart", js.FuncOf(jsStart))
 
 	// Signal readiness so the JS loader stops polling.
 	js.Global().Set("raftReady", true)
@@ -206,6 +207,34 @@ func jsDeleteNode(this js.Value, args []js.Value) any {
 }
 
 func jsReset(this js.Value, args []js.Value) any {
+	tearDown()
+	world.mu.Lock()
+	world.startFresh(3)
+	world.mu.Unlock()
+	return nil
+}
+
+// jsShutdown stops all nodes and leaves the cluster empty. The next jsStart or
+// jsReset recreates fresh nodes.
+func jsShutdown(this js.Value, args []js.Value) any {
+	tearDown()
+	return nil
+}
+
+// jsStart boots a fresh 3-node cluster if the cluster is currently empty. If
+// nodes already exist it is a no-op, so remounting the UI while a cluster is
+// alive doesn't double-start.
+func jsStart(this js.Value, args []js.Value) any {
+	world.mu.Lock()
+	defer world.mu.Unlock()
+	if len(world.nodes) > 0 {
+		return nil
+	}
+	world.startFresh(3)
+	return nil
+}
+
+func tearDown() {
 	world.mu.Lock()
 	old := world.nodes
 	world.nodes = nil
@@ -215,15 +244,9 @@ func jsReset(this js.Value, args []js.Value) any {
 		n.Shutdown()
 	}
 
-	// Clear the registry so fresh addr→handler mappings win.
 	regMu.Lock()
 	registry = map[string]nodeHandler{}
 	regMu.Unlock()
-
-	world.mu.Lock()
-	world.startFresh(3)
-	world.mu.Unlock()
-	return nil
 }
 
 // ---------- state → JS shape ----------
