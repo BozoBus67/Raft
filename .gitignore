@@ -1,3 +1,5 @@
 state/
 raft_2
 *.test
+/raft
+/raft.wasm

@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
-	"net/rpc"
-	"os"
 	"sync"
 	"time"
 )
@@ -48,7 +45,6 @@ type Node struct {
 
 	// identity + cluster
 	id    int
-	addr  string
 	peers map[int]string
 
 	// persistent (fsync'd on change)
@@ -73,22 +69,23 @@ type Node struct {
 	triggerReplicateCh chan struct{}
 	commitReadyCh      chan struct{}
 
-	// storage
-	storagePath string
+	// injected boundaries
+	transport Transport
+	clock     Clock
+	storage   Storage
+	rng       *rand.Rand
 
 	// state machine, mutated only under n.mu by applier or Submit
 	kv map[string]string
 
-	// RPC listener + shutdown
-	listener net.Listener
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	// shutdown
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
-func NewNode(id int, addr string, peerIDs map[int]string, storageDir string) *Node {
+func NewNode(id int, peerIDs map[int]string, transport Transport, clock Clock, storage Storage, rng *rand.Rand) *Node {
 	n := &Node{
 		id:                 id,
-		addr:               addr,
 		peers:              copyPeerMap(peerIDs),
 		currentTerm:        0,
 		votedFor:           -1,
@@ -100,7 +97,10 @@ func NewNode(id int, addr string, peerIDs map[int]string, storageDir string) *No
 		matchIndex:         map[int]int{},
 		triggerReplicateCh: make(chan struct{}, 1),
 		commitReadyCh:      make(chan struct{}, 1),
-		storagePath:        stateFilePath(storageDir, id),
+		transport:          transport,
+		clock:              clock,
+		storage:            storage,
+		rng:                rng,
 		kv:                 map[string]string{},
 		stopCh:             make(chan struct{}),
 	}
@@ -119,28 +119,11 @@ func copyPeerMap(src map[int]string) map[int]string {
 	return out
 }
 
-// Serve starts the RPC listener and background loops.
+// Serve starts the transport and background loops.
 func (n *Node) Serve() error {
-	dispatcher := rpc.NewServer()
-	if err := dispatcher.RegisterName("Node", n); err != nil {
+	if err := n.transport.Start(n); err != nil {
 		return err
 	}
-	l, err := net.Listen("tcp", n.addr)
-	if err != nil {
-		return err
-	}
-	n.listener = l
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return // listener closed on shutdown
-			}
-			go dispatcher.ServeConn(conn)
-		}
-	}()
 
 	n.wg.Add(1)
 	go n.electionTimerLoop()
@@ -148,7 +131,7 @@ func (n *Node) Serve() error {
 	n.wg.Add(1)
 	go n.applierLoop()
 
-	log.Printf("[node %d] listening on %s term=%d", n.id, n.addr, n.currentTerm)
+	log.Printf("[node %d] serving term=%d", n.id, n.currentTerm)
 	return nil
 }
 
@@ -163,9 +146,7 @@ func (n *Node) Shutdown() {
 	close(n.stopCh)
 	n.mu.Unlock()
 
-	if n.listener != nil {
-		_ = n.listener.Close()
-	}
+	_ = n.transport.Close()
 	n.wg.Wait()
 	log.Printf("[node %d] shut down", n.id)
 }
@@ -185,26 +166,26 @@ func (n *Node) becomeFollower(term int) {
 // Called with n.mu held.
 func (n *Node) resetElectionTimeout() {
 	span := maxElectionTimeout - minElectionTimeout
-	n.electionTimeout = minElectionTimeout + time.Duration(rand.Int63n(int64(span)))
-	n.electionResetAt = time.Now()
+	n.electionTimeout = minElectionTimeout + time.Duration(n.rng.Int63n(int64(span)))
+	n.electionResetAt = n.clock.Now()
 }
 
 func (n *Node) electionTimerLoop() {
 	defer n.wg.Done()
-	t := time.NewTicker(electionTimerTick)
+	t := n.clock.NewTicker(electionTimerTick)
 	defer t.Stop()
 	for {
 		select {
 		case <-n.stopCh:
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		n.mu.Lock()
 		if n.role == Dead || n.role == Leader {
 			n.mu.Unlock()
 			continue
 		}
-		if time.Since(n.electionResetAt) >= n.electionTimeout {
+		if n.clock.Since(n.electionResetAt) >= n.electionTimeout {
 			n.startElectionLocked()
 		}
 		n.mu.Unlock()
@@ -237,7 +218,7 @@ func (n *Node) startElectionLocked() {
 				LastLogTerm:  lastTerm,
 			}
 			var reply RequestVoteReply
-			if !callRPC(peerAddr, "Node.RequestVote", &args, &reply) {
+			if !n.transport.SendRequestVote(peerAddr, args, &reply) {
 				return
 			}
 			n.mu.Lock()
@@ -293,7 +274,7 @@ func (n *Node) becomeLeaderLocked() {
 // exits when this node stops being leader at `term`.
 func (n *Node) leaderLoop(term int) {
 	defer n.wg.Done()
-	t := time.NewTicker(heartbeatInterval)
+	t := n.clock.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
 		n.mu.Lock()
@@ -311,7 +292,7 @@ func (n *Node) leaderLoop(term int) {
 		select {
 		case <-n.stopCh:
 			return
-		case <-t.C:
+		case <-t.C():
 		case <-n.triggerReplicateCh:
 		}
 	}
@@ -343,7 +324,7 @@ func (n *Node) sendAppendEntries(peerID int, peerAddr string, term int) {
 		LeaderCommit: leaderCommit,
 	}
 	var reply AppendEntriesReply
-	if !callRPC(peerAddr, "Node.AppendEntries", &args, &reply) {
+	if !n.transport.SendAppendEntries(peerAddr, args, &reply) {
 		return
 	}
 
@@ -601,7 +582,7 @@ func (n *Node) Submit(op Op, key, value string) (index int, term int, ok bool) {
 // the timeout elapses. Returns false if the entry got overwritten (deposed
 // leader) or we timed out.
 func (n *Node) WaitForCommit(index, term int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
+	deadline := n.clock.Now().Add(timeout)
 	for {
 		n.mu.Lock()
 		if index < len(n.log) && n.log[index].Term == term && n.commitIndex >= index {
@@ -614,10 +595,10 @@ func (n *Node) WaitForCommit(index, term int, timeout time.Duration) bool {
 			return false
 		}
 		n.mu.Unlock()
-		if time.Now().After(deadline) {
+		if n.clock.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(5 * time.Millisecond)
+		n.clock.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -650,26 +631,32 @@ func (n *Node) signalCommitReady() {
 	}
 }
 
-// callRPC dials + calls with independent timeouts so a dead peer never blocks
-// caller goroutines. Returns true iff the call round-tripped.
-func callRPC(addr, method string, args any, reply any) bool {
-	conn, err := net.DialTimeout("tcp", addr, rpcDialTimeout)
-	if err != nil {
-		return false
+// savePersist writes currentTerm+votedFor+log through the Storage boundary.
+// Called with n.mu held. Fatal on error to match the paper's safety contract:
+// losing a persisted write mid-run is unrecoverable.
+func (n *Node) savePersist() {
+	state := PersistedState{
+		CurrentTerm: n.currentTerm,
+		VotedFor:    n.votedFor,
+		Log:         n.log,
 	}
-	client := rpc.NewClient(conn)
-	defer client.Close()
-
-	call := client.Go(method, args, reply, nil)
-	select {
-	case <-call.Done:
-		return call.Error == nil
-	case <-time.After(rpcCallTimeout):
-		return false
+	if err := n.storage.Save(state); err != nil {
+		log.Fatalf("[node %d] persist save: %v", n.id, err)
 	}
 }
 
-func fatalf(format string, a ...any) {
-	log.Printf(format, a...)
-	os.Exit(1)
+// loadPersist reads currentTerm+votedFor+log. If storage reports no record,
+// the caller keeps the sentinel-only log it already installed.
+// Called with n.mu held.
+func (n *Node) loadPersist() {
+	state, found, err := n.storage.Load()
+	if err != nil {
+		log.Fatalf("[node %d] persist load: %v", n.id, err)
+	}
+	if !found {
+		return
+	}
+	n.currentTerm = state.CurrentTerm
+	n.votedFor = state.VotedFor
+	n.log = state.Log
 }

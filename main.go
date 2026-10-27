@@ -1,3 +1,5 @@
+//go:build !js
+
 package main
 
 import (
@@ -21,7 +23,6 @@ const stateDir = "state"
 
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
-	rand.Seed(time.Now().UnixNano())
 
 	if err := wipeStateDir(stateDir); err != nil {
 		log.Fatalf("wipe state dir: %v", err)
@@ -42,6 +43,7 @@ func makeCluster() []*Node {
 	for _, c := range clusterConfig {
 		addrByID[c.ID] = c.Addr
 	}
+	clock := NewRealClock()
 	nodes := make([]*Node, 0, len(clusterConfig))
 	for _, c := range clusterConfig {
 		peers := map[int]string{}
@@ -50,7 +52,10 @@ func makeCluster() []*Node {
 				peers[id] = addr
 			}
 		}
-		nodes = append(nodes, NewNode(c.ID, c.Addr, peers, stateDir))
+		transport := NewTCPTransport(c.Addr)
+		storage := NewFileStorage(stateDir, c.ID)
+		rng := rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(c.ID)))
+		nodes = append(nodes, NewNode(c.ID, peers, transport, clock, storage, rng))
 	}
 	return nodes
 }

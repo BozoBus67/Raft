@@ -1,3 +1,3 @@
-module raft_2
+module raft
 
 go 1.22
